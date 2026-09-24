@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>冷库拼箱调度台</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1720; color: #dfe7ee; padding: 20px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #7d8ea0; font-size: 13px; margin-bottom: 16px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .toolbar label { font-size: 13px; color: #9fb2c5; }
+  select, button, input { font: inherit; border-radius: 6px; border: 1px solid #2c3e50; background: #1b2836; color: #dfe7ee; padding: 6px 10px; }
+  button { cursor: pointer; }
+  button:hover { background: #24364a; }
+  button.primary { background: #1d6fd1; border-color: #1d6fd1; color: #fff; }
+  button.primary:hover { background: #2a80e2; }
+  button.small { padding: 3px 8px; font-size: 12px; }
+  .layout { display: grid; grid-template-columns: 1fr 1.4fr; gap: 16px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .panel { background: #15202c; border: 1px solid #24344a; border-radius: 10px; padding: 14px; }
+  .panel h2 { font-size: 15px; margin-bottom: 10px; color: #aec6dd; }
+  .cab { border: 1px solid #2a3c52; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .cab-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
+  .cab-head .zone-tag { font-weight: 600; }
+  .bar { height: 10px; background: #0d141c; border-radius: 5px; overflow: hidden; margin-bottom: 6px; }
+  .bar > div { height: 100%; background: linear-gradient(90deg, #2a80e2, #35c4a0); transition: width .3s; }
+  .cab-items { font-size: 12px; color: #9fb2c5; }
+  .cab-items span { display: inline-block; background: #1b2836; border-radius: 4px; padding: 2px 6px; margin: 2px 4px 2px 0; }
+  .pending-count { color: #e8b34b; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #22303f; vertical-align: middle; }
+  th { color: #7d8ea0; font-weight: 500; font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; }
+  .tag.urgent { background: #5a2a2a; color: #ff9d8a; }
+  .tag.ok { background: #1e4636; color: #6fe3ae; }
+  .tag.wait { background: #4a3a1a; color: #e8b34b; }
+  .tag.loaded { background: #1d3a5f; color: #7db8f0; }
+  .tag.no-cert { background: #46223a; color: #e08ac0; }
+  .row-actions { white-space: nowrap; }
+  .row-actions button { margin-right: 4px; }
+  .edit-zone, .edit-vol { width: 76px; padding: 3px 6px; font-size: 12px; }
+  .edit-vol { width: 60px; }
+  .empty { color: #5b6b7c; font-size: 13px; padding: 8px 0; }
+  .log { font-size: 12px; color: #8fa3b8; max-height: 130px; overflow-y: auto; margin-top: 10px; border-top: 1px dashed #24344a; padding-top: 8px; }
+  .log div { padding: 1px 0; }
+</style>
+</head>
+<body>
+<h1>冷库拼箱调度台</h1>
+<div class="sub">急货（截港不足 2 小时）优先挑柜 · 已入柜不挪位 · 缺冷处理证明先排队 · 改温区/体积将释放柜位并重新排队</div>
+
+<div class="toolbar">
+  <label>温区筛选</label>
+  <select id="zoneFilter">
+    <option value="">全部温区</option>
+  </select>
+  <button id="replanBtn" class="primary">重新排柜</button>
+  <button id="resetBtn">清空并重置数据</button>
+</div>
+
+<div class="layout">
+  <div class="panel">
+    <h2>温区柜占用</h2>
+    <div id="cabinetList"></div>
+  </div>
+  <div class="panel">
+    <h2>货物队列</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>货号</th><th>温区</th><th>体积(m³)</th><th>截港时刻</th><th>冷处理</th><th>状态</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="cargoRows"></tbody>
+    </table>
+    <div class="log" id="logBox"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+ * 第一层：判断逻辑（纯函数，不碰 DOM、不碰存储）
+ * =================================================================== */
+const Logic = {
+  URGENT_MS: 2 * 60 * 60 * 1000, // 两小时
+
+  // 截港不足两小时视为急货（含已超时）
+  isUrgent(cargo, now) {
+    return new Date(cargo.cutoff).getTime() - now.getTime() <= Logic.URGENT_MS;
+  },
+
+  // 温区匹配且剩余容积足够
+  canFit(cabinet, cargo) {
+    return cabinet.zone === cargo.zone &&
+           cabinet.used + cargo.volume <= cabinet.capacity;
+  },
+
+  // 为一票货挑柜：同温区、装得下的柜中，选剩余容积最刚好（最小浪费）的
+  pickCabinet(cabinets, cargo) {
+    let best = null;
+    for (const cab of cabinets) {
+      if (!Logic.canFit(cab, cargo)) continue;
+      const slack = cab.capacity - cab.used - cargo.volume;
+      if (!best || slack < best.slack) best = { cab, slack };
+    }
+    return best ? best.cab : null;
+  },
+
+  /**
+   * 排队调度：已入柜的不动，对待入柜的货按「急货优先、截港早优先」排序，
+   * 依次挑柜。缺冷处理证明的货不参与入柜。
+   * 返回本次新入柜的货号列表（用于日志）。
+   */
+  allocate(state, now) {
+    const newlyLoaded = [];
+    const queue = state.cargos
+      .filter(c => c.status === 'queued' && c.coldTreated)
+      .sort((a, b) => {
+        const ua = Logic.isUrgent(a, now) ? 0 : 1;
+        const ub = Logic.isUrgent(b, now) ? 0 : 1;
+        if (ua !== ub) return ua - ub;
+        return new Date(a.cutoff) - new Date(b.cutoff);
+      });
+
+    for (const cargo of queue) {
+      const cab = Logic.pickCabinet(state.cabinets, cargo);
+      if (cab) {
+        cab.used += cargo.volume;
+        cargo.status = 'loaded';
+        cargo.cabinetId = cab.id;
+        newlyLoaded.push(cargo.id);
+      }
+    }
+    return newlyLoaded;
+  },
+
+  // 释放某票货占用的柜位（改温区/体积、重置时用）
+  release(state, cargo) {
+    if (cargo.status !== 'loaded') return false;
+    const cab = state.cabinets.find(c => c.id === cargo.cabinetId);
+    if (cab) cab.used = Math.max(0, cab.used - cargo.volume);
+    cargo.status = 'queued';
+    cargo.cabinetId = null;
+    return true;
+  },
+
+  // 各温区待处理（未入柜）票数统计
+  pendingByZone(state) {
+    const map = {};
+    for (const c of state.cargos) {
+      if (c.status !== 'loaded') map[c.zone] = (map[c.zone] || 0) + 1;
+    }
+    return map;
+  }
+};
+
+/* =====================================================================
+ * 第二层：本地保存（localStorage 读写与初始数据）
+ * =================================================================== */
+const Store = {
+  KEY: 'cold-storage-dispatch-v1',
+
+  // 初始数据：三个温区柜 + 六票货（截港时刻相对当前时间生成，保证演示效果）
+  seed() {
+    const now = Date.now();
+    const H = 60 * 60 * 1000;
+    return {
+      cabinets: [
+        { id: 'CAB-F1', name: '冷冻柜 F1', zone: '冷冻(-18℃)', capacity: 30, used: 0 },
+        { id: 'CAB-C1', name: '冷藏柜 C1', zone: '冷藏(0~4℃)', capacity: 30, used: 0 },
+        { id: 'CAB-T1', name: '恒温柜 T1', zone: '恒温(15℃)',  capacity: 30, used: 0 }
+      ],
+      cargos: [
+        { id: 'FH-101', zone: '冷冻(-18℃)', volume: 12, cutoff: new Date(now + 1 * H).toISOString(),       coldTreated: true,  status: 'queued', cabinetId: null },
+        { id: 'FH-102', zone: '冷冻(-18℃)', volume: 10, cutoff: new Date(now + 5 * H).toISOString(),       coldTreated: true,  status: 'queued', cabinetId: null },
+        { id: 'FH-103', zone: '冷冻(-18℃)', volume: 15, cutoff: new Date(now + 3 * H).toISOString(),       coldTreated: false, status: 'queued', cabinetId: null },
+        { id: 'FH-104', zone: '冷藏(0~4℃)', volume: 14, cutoff: new Date(now + 1.5 * H).toISOString(),     coldTreated: true,  status: 'queued', cabinetId: null },
+        { id: 'FH-105', zone: '冷藏(0~4℃)', volume: 20, cutoff: new Date(now + 4 * H).toISOString(),       coldTreated: true,  status: 'queued', cabinetId: null },
+        { id: 'FH-106', zone: '恒温(15℃)',  volume: 8,  cutoff: new Date(now + 6 * H).toISOString(),       coldTreated: false, status: 'queued', cabinetId: null }
+      ]
+    };
+  },
+
+  load() {
+    try {
+      const raw = localStorage.getItem(Store.KEY);
+      if (raw) return JSON.parse(raw);
+    } catch (e) { /* 数据损坏则回退到初始数据 */ }
+    const fresh = Store.seed();
+    Store.save(fresh);
+    return fresh;
+  },
+
+  save(state) {
+    localStorage.setItem(Store.KEY, JSON.stringify(state));
+  },
+
+  clear() {
+    localStorage.removeItem(Store.KEY);
+  }
+};
+
+/* =====================================================================
+ * 第三层：页面交互（DOM 渲染与事件绑定，业务判断一律走 Logic）
+ * =================================================================== */
+const UI = {
+  state: null,
+  zoneFilter: '',
+
+  init() {
+    UI.state = Store.load();
+    // 首次进入或重置后，先跑一遍排柜
+    UI.replan(false);
+    UI.bindToolbar();
+    UI.render();
+  },
+
+  // 执行排柜并落库
+  replan(rerender = true) {
+    const loaded = Logic.allocate(UI.state, new Date());
+    if (loaded.length) UI.log('入柜：' + loaded.join('、'));
+    Store.save(UI.state);
+    if (rerender) UI.render();
+  },
+
+  bindToolbar() {
+    const filter = document.getElementById('zoneFilter');
+    const zones = [...new Set(UI.state.cabinets.map(c => c.zone))];
+    for (const z of zones) {
+      const opt = document.createElement('option');
+      opt.value = z; opt.textContent = z;
+      filter.appendChild(opt);
+    }
+    filter.addEventListener('change', () => {
+      UI.zoneFilter = filter.value;
+      UI.render();
+    });
+    document.getElementById('replanBtn').addEventListener('click', () => UI.replan());
+    document.getElementById('resetBtn').addEventListener('click', () => {
+      if (!confirm('确定清空本地数据并恢复初始六票货？')) return;
+      Store.clear();
+      UI.state = Store.load();
+      UI.log('已重置为空仓库初始数据');
+      UI.replan();
+    });
+  },
+
+  render() {
+    UI.renderCabinets();
+    UI.renderCargos();
+  },
+
+  renderCabinets() {
+    const box = document.getElementById('cabinetList');
+    box.innerHTML = '';
+    const pending = Logic.pendingByZone(UI.state);
+    const cabs = UI.state.cabinets.filter(c => !UI.zoneFilter || c.zone === UI.zoneFilter);
+    if (!cabs.length) { box.innerHTML = '<div class="empty">该温区暂无柜位</div>'; return; }
+
+    for (const cab of cabs) {
+      const pct = Math.round(cab.used / cab.capacity * 100);
+      const items = UI.state.cargos.filter(c => c.cabinetId === cab.id);
+      const waitN = pending[cab.zone] || 0;
+      const div = document.createElement('div');
+      div.className = 'cab';
+      div.innerHTML =
+        '<div class="cab-head">' +
+          '<span class="zone-tag">' + cab.name + ' · ' + cab.zone + '</span>' +
+          '<span>' + cab.used + ' / ' + cab.capacity + ' m³（' + pct + '%） ' +
+          '<span class="pending-count">待处理 ' + waitN + ' 票</span></span>' +
+        '</div>' +
+        '<div class="bar"><div style="width:' + pct + '%"></div></div>' +
+        '<div class="cab-items">' +
+          (items.length
+            ? items.map(c => '<span>' + c.id + ' · ' + c.volume + 'm³</span>').join('')
+            : '空柜') +
+        '</div>';
+      box.appendChild(div);
+    }
+  },
+
+  renderCargos() {
+    const tbody = document.getElementById('cargoRows');
+    tbody.innerHTML = '';
+    const now = new Date();
+    const list = UI.state.cargos.filter(c => !UI.zoneFilter || c.zone === UI.zoneFilter);
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">该温区暂无货物</td></tr>';
+      return;
+    }
+
+    for (const cargo of list) {
+      const tr = document.createElement('tr');
+      const cutoff = new Date(cargo.cutoff);
+      const urgent = Logic.isUrgent(cargo, now);
+
+      // 状态标签
+      let statusTag;
+      if (cargo.status === 'loaded') {
+        statusTag = '<span class="tag loaded">已入柜 ' + cargo.cabinetId + '</span>';
+      } else if (!cargo.coldTreated) {
+        statusTag = '<span class="tag no-cert">缺冷处理证明 · 排队中</span>';
+      } else {
+        statusTag = '<span class="tag wait">待入柜（容积不足）</span>';
+      }
+
+      tr.innerHTML =
+        '<td><strong>' + cargo.id + '</strong>' + (urgent ? ' <span class="tag urgent">急</span>' : '') + '</td>' +
+        '<td class="cell-zone">' + cargo.zone + '</td>' +
+        '<td class="cell-vol">' + cargo.volume + '</td>' +
+        '<td>' + UI.fmtTime(cutoff) + '</td>' +
+        '<td>' + (cargo.coldTreated
+            ? '<span class="tag ok">已冷处理</span>'
+            : '<span class="tag no-cert">缺证明</span>') + '</td>' +
+        '<td>' + statusTag + '</td>' +
+        '<td class="row-actions"></td>';
+
+      const actions = tr.querySelector('.row-actions');
+
+      // 补齐冷处理证明 → 重新尝试入柜
+      if (!cargo.coldTreated) {
+        const btn = document.createElement('button');
+        btn.className = 'small primary';
+        btn.textContent = '补齐证明';
+        btn.addEventListener('click', () => {
+          cargo.coldTreated = true;
+          UI.log(cargo.id + ' 已补齐冷处理证明，重新排队');
+          UI.replan();
+        });
+        actions.appendChild(btn);
+      }
+
+      // 修改温区/体积 → 释放原柜位并重新排队
+      const editBtn = document.createElement('button');
+      editBtn.className = 'small';
+      editBtn.textContent = '改温区/体积';
+      editBtn.addEventListener('click', () => UI.enterEdit(tr, cargo));
+      actions.appendChild(editBtn);
+
+      tbody.appendChild(tr);
+    }
+  },
+
+  // 行内编辑温区与体积
+  enterEdit(tr, cargo) {
+    const zoneCell = tr.querySelector('.cell-zone');
+    const volCell = tr.querySelector('.cell-vol');
+    const actions = tr.querySelector('.row-actions');
+    const zones = [...new Set(UI.state.cabinets.map(c => c.zone))];
+
+    zoneCell.innerHTML = '';
+    const zoneSel = document.createElement('select');
+    zoneSel.className = 'edit-zone';
+    for (const z of zones) {
+      const opt = document.createElement('option');
+      opt.value = z; opt.textContent = z;
+      if (z === cargo.zone) opt.selected = true;
+      zoneSel.appendChild(opt);
+    }
+    zoneCell.appendChild(zoneSel);
+
+    volCell.innerHTML = '';
+    const volInput = document.createElement('input');
+    volInput.type = 'number'; volInput.min = '1'; volInput.step = '0.5';
+    volInput.value = cargo.volume;
+    volInput.className = 'edit-vol';
+    volCell.appendChild(volInput);
+
+    actions.innerHTML = '';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'small primary';
+    saveBtn.textContent = '保存';
+    saveBtn.addEventListener('click', () => {
+      const newZone = zoneSel.value;
+      const newVol = parseFloat(volInput.value);
+      if (!newVol || newVol <= 0) { alert('体积必须为正数'); return; }
+      const changed = newZone !== cargo.zone || newVol !== cargo.volume;
+      if (changed) {
+        const wasLoaded = Logic.release(UI.state, cargo); // 释放原柜位
+        cargo.zone = newZone;
+        cargo.volume = newVol;
+        UI.log(cargo.id + ' 已修改温区/体积，' + (wasLoaded ? '释放原柜位，' : '') + '重新排队');
+        UI.replan();
+      } else {
+        UI.render();
+      }
+    });
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'small';
+    cancelBtn.textContent = '取消';
+    cancelBtn.addEventListener('click', () => UI.render());
+    actions.appendChild(saveBtn);
+    actions.appendChild(cancelBtn);
+  },
+
+  fmtTime(d) {
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  },
+
+  log(msg) {
+    const box = document.getElementById('logBox');
+    const line = document.createElement('div');
+    line.textContent = '[' + UI.fmtTime(new Date()) + '] ' + msg;
+    box.prepend(line);
+  }
+};
+
+UI.init();
+</script>
+</body>
+</html>
